@@ -1,531 +1,437 @@
 #!/usr/bin/env python3
 """
-El Sabueso — Agent 1: Content Hunter
-Lee URLs Monitor → Scraping Apify → Clasificación GVB → Hooks DB
+sabueso.py — Agente 1 del sistema GVB @byduvan_ai
+Lee Competidores + Referentes + Mis Ideas (Viral/Explorar) desde Notion
+→ Scraping con Apify → Filtra outliers → Clasifica patrón GVB → Escribe Hooks DB
+
+Uso:
+    python3 sabueso.py
+    python3 sabueso.py --dry-run
+    python3 sabueso.py --source competidores
+    python3 sabueso.py --source referentes
+    python3 sabueso.py --source viral
+    python3 sabueso.py --limit 5
 """
 
 import os
-import json
+import re
 import sys
 import time
-import re
-from datetime import datetime, date
-from typing import List, Dict, Optional
-from dataclasses import dataclass
+import json
 import argparse
-
 import requests
+from datetime import datetime, date
 from dotenv import load_dotenv
 
 load_dotenv()
 
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
+# ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 
-if not NOTION_API_KEY or not APIFY_API_TOKEN:
-    print("❌ Faltan variables de entorno: NOTION_API_KEY, APIFY_API_TOKEN")
-    sys.exit(1)
+NOTION_API_KEY   = os.getenv("NOTION_API_KEY")
+APIFY_API_TOKEN  = os.getenv("APIFY_API_TOKEN")
 
-# Notion bases
-URLS_MONITOR_DS = "01901dbf-447d-4425-a06d-a042ec223e7c"
-HOOKS_DB_DS = "ec06af9a-f1fb-4fd0-83f0-1cdf9fe941a5"
+NOTION_VERSION   = "2022-06-28"
+NOTION_BASE      = "https://api.notion.com/v1"
+APIFY_BASE       = "https://api.apify.com/v2"
 
-NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_API_KEY}",
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28",
-}
+# IDs de colección Notion
+COMPETIDORES_DB  = "6d44cbde-c6cb-470a-9bd4-c2100562de56"
+REFERENTES_DB    = "c08bdc84-071a-4032-83a0-860b0e36f118"
+MIS_IDEAS_DB     = "9ed953db-9a49-4d3c-b786-6dec10264490"
+HOOKS_DB         = "ec06af9a-f1fb-4fd0-83f0-1cdf9fe941a5"
 
-@dataclass
-class VideoData:
-    """Estructura de datos de un video procesado"""
-    title: str
-    url: str
-    likes: int
-    views: int
-    caption: str
-    transcript: str = ""
-    duration_sec: int = 0
-    post_date: str = ""
-    username: str = ""
-    tipo: str = "Video"  # Canal o Video
-    lista: str = ""  # Competidores, Referentes, Viral/Explorar
+# Apify actors
+ACTOR_CANAL      = "sian.agency~instagram-ai-transcript-extractor"
+ACTOR_URLS       = "apify~instagram-scraper"
 
-def notion_query(database_id: str, filter_dict: Optional[Dict] = None) -> List[Dict]:
-    """Consultar Notion database con filtro"""
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    payload = {"filter": filter_dict} if filter_dict else {}
+OUTLIER_UMBRAL   = 3.0
+REELS_POR_CANAL  = 10
 
-    try:
-        resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
-        resp.raise_for_status()
-        return resp.json()["results"]
-    except Exception as e:
-        print(f"❌ Error Notion query: {e}")
-        return []
+# ─── NOTION HELPERS ───────────────────────────────────────────────────────────
 
-def get_pending_urls() -> Dict[str, List[Dict]]:
-    """Lee URLs Monitor, agrupa por Lista"""
-    filter_dict = {
-        "property": "Estado",
-        "select": {"equals": "Pendiente"}
+def notion_headers():
+    return {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
     }
 
-    rows = notion_query(URLS_MONITOR_DS, filter_dict)
-    grouped = {"Competidores": [], "Referentes": [], "Viral/Explorar": []}
+def notion_query(database_id: str, filter_body: dict = None) -> list:
+    url = f"{NOTION_BASE}/databases/{database_id}/query"
+    payload = {"page_size": 100}
+    if filter_body:
+        payload["filter"] = filter_body
+    rows = []
+    while True:
+        resp = requests.post(url, headers=notion_headers(), json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        rows.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+    return rows
 
-    for row in rows:
-        props = row["properties"]
-        try:
-            lista = props["Lista"]["select"]["name"]
-            tipo = props["Tipo"]["select"]["name"]
-            url = props.get("userDefined:URL", {}).get("url", "")
-            nombre = props["Nombre"]["title"][0]["plain_text"] if props["Nombre"]["title"] else ""
-
-            if lista in grouped and url:
-                grouped[lista].append({
-                    "id": row["id"],
-                    "nombre": nombre,
-                    "url": url,
-                    "tipo": tipo,
-                    "lista": lista
-                })
-        except (KeyError, IndexError, TypeError) as e:
-            print(f"⚠️  Error parseando fila: {e}")
-
-    return grouped
-
-def extract_username(url: str) -> str:
-    """Extrae username de URL de Instagram"""
-    # instagram.com/usuario → usuario
-    match = re.search(r"instagram\.com/([a-zA-Z0-9_.]+)", url)
-    if match:
-        return match.group(1).rstrip("/")
+def get_prop(page: dict, name: str):
+    props = page.get("properties", {})
+    prop = props.get(name, {})
+    t = prop.get("type", "")
+    if t == "title":
+        items = prop.get("title", [])
+        return items[0]["plain_text"] if items else ""
+    if t == "rich_text":
+        items = prop.get("rich_text", [])
+        return items[0]["plain_text"] if items else ""
+    if t == "select":
+        sel = prop.get("select")
+        return sel["name"] if sel else ""
+    if t == "checkbox":
+        return prop.get("checkbox", False)
+    if t == "url":
+        return prop.get("url", "")
+    if t == "number":
+        return prop.get("number")
+    if t == "date":
+        d = prop.get("date")
+        return d["start"] if d else ""
     return ""
 
-def call_apify_actor(actor_id: str, input_dict: Dict) -> Optional[str]:
-    """Crea run en Apify, polling hasta SUCCEEDED, retorna dataset ID"""
-    url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
-    headers = {"Authorization": f"Bearer {APIFY_API_TOKEN}"}
+def notion_update_page(page_id: str, properties: dict):
+    url = f"{NOTION_BASE}/pages/{page_id}"
+    resp = requests.patch(url, headers=notion_headers(), json={"properties": properties})
+    resp.raise_for_status()
+    return resp.json()
 
-    try:
-        resp = requests.post(url, headers=headers, json=input_dict)
-        resp.raise_for_status()
-        run_id = resp.json()["data"]["id"]
-        print(f"  📡 Apify run iniciado: {run_id}")
-
-        # Polling
-        for attempt in range(120):  # 10 minutos max
-            check_url = f"https://api.apify.com/v2/acts/{actor_id}/runs/{run_id}"
-            check_resp = requests.get(check_url, headers=headers)
-            check_resp.raise_for_status()
-
-            status = check_resp.json()["data"]["status"]
-            if status == "SUCCEEDED":
-                dataset_id = check_resp.json()["data"]["defaultDatasetId"]
-                print(f"  ✓ Completado: {dataset_id}")
-                return dataset_id
-            elif status in ["FAILED", "ABORTED"]:
-                print(f"  ❌ Run falló: {status}")
-                return None
-
-            time.sleep(5)
-
-        print(f"  ⏱️  Timeout esperando Apify")
-        return None
-    except Exception as e:
-        print(f"  ❌ Error Apify: {e}")
-        return None
-
-def get_apify_dataset(dataset_id: str) -> List[Dict]:
-    """Lee items del dataset de Apify"""
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    headers = {"Authorization": f"Bearer {APIFY_API_TOKEN}"}
-
-    try:
-        resp = requests.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"  ❌ Error reading Apify dataset: {e}")
-        return []
-
-def process_canal(nombre: str, url: str) -> List[VideoData]:
-    """Procesa Canal (Competidores/Referentes) con transcript extractor"""
-    username = extract_username(url)
-    if not username:
-        print(f"  ⚠️  No se pudo extraer username de {url}")
-        return []
-
-    print(f"  🔍 Procesando canal: @{username}")
-
-    input_dict = {
-        "channelUsername": username,
-        "reelCount": 10
+def notion_create_page(database_id: str, properties: dict):
+    url = f"{NOTION_BASE}/pages"
+    payload = {
+        "parent": {"database_id": database_id},
+        "properties": properties,
     }
+    resp = requests.post(url, headers=notion_headers(), json=payload)
+    resp.raise_for_status()
+    return resp.json()
 
-    dataset_id = call_apify_actor("sian.agency/instagram-ai-transcript-extractor", input_dict)
-    if not dataset_id:
+# ─── LEER FUENTES DESDE NOTION ────────────────────────────────────────────────
+
+def leer_competidores() -> list[dict]:
+    rows = notion_query(COMPETIDORES_DB, {
+        "property": "Activo",
+        "checkbox": {"equals": True}
+    })
+    resultado = []
+    for row in rows:
+        handle = get_prop(row, "Handle").lstrip("@")
+        url    = get_prop(row, "URL Instagram")
+        if handle:
+            resultado.append({"handle": handle, "url": url, "tipo": "competidor"})
+    print(f"  → {len(resultado)} competidores activos")
+    return resultado
+
+def leer_referentes() -> list[dict]:
+    rows = notion_query(REFERENTES_DB, {
+        "property": "Activo",
+        "checkbox": {"equals": True}
+    })
+    resultado = []
+    for row in rows:
+        nombre    = get_prop(row, "Nombre")
+        url_canal = get_prop(row, "URL Canal")
+        plataforma = get_prop(row, "Plataforma")
+        if url_canal:
+            resultado.append({
+                "nombre": nombre,
+                "url": url_canal,
+                "plataforma": plataforma or "Instagram",
+                "tipo": "referente"
+            })
+    print(f"  → {len(resultado)} referentes activos")
+    return resultado
+
+def leer_viral_explorar() -> list[dict]:
+    rows = notion_query(MIS_IDEAS_DB, {
+        "and": [
+            {"property": "Origen",  "select": {"equals": "Viral/Explorar"}},
+            {"property": "Estado",  "select": {"equals": "Idea cruda"}},
+        ]
+    })
+    resultado = []
+    for row in rows:
+        url  = get_prop(row, "De que va")
+        idea = get_prop(row, "Idea")
+        if url and url.startswith("http"):
+            resultado.append({"url": url, "idea": idea, "page_id": row["id"], "tipo": "viral"})
+    print(f"  → {len(resultado)} URLs en Viral/Explorar")
+    return resultado
+
+def marcar_viral_procesado(page_id: str):
+    notion_update_page(page_id, {
+        "Estado": {"select": {"name": "Procesado"}}
+    })
+
+# ─── APIFY HELPERS ────────────────────────────────────────────────────────────
+
+def apify_run_actor(actor_id: str, input_data: dict, timeout: int = 300) -> list:
+    url = f"{APIFY_BASE}/acts/{actor_id}/runs?token={APIFY_API_TOKEN}"
+    resp = requests.post(url, json=input_data)
+    resp.raise_for_status()
+    run_id = resp.json()["data"]["id"]
+
+    status_url = f"{APIFY_BASE}/actor-runs/{run_id}?token={APIFY_API_TOKEN}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(8)
+        r = requests.get(status_url)
+        r.raise_for_status()
+        status = r.json()["data"]["status"]
+        if status == "SUCCEEDED":
+            break
+        if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+            print(f"  ⚠️  Actor {actor_id} terminó con estado: {status}")
+            return []
+    else:
+        print(f"  ⚠️  Timeout esperando actor {actor_id}")
         return []
 
-    items = get_apify_dataset(dataset_id)
-    videos = []
+    dataset_id = r.json()["data"]["defaultDatasetId"]
+    items_url  = f"{APIFY_BASE}/datasets/{dataset_id}/items?token={APIFY_API_TOKEN}&format=json"
+    items_resp = requests.get(items_url)
+    items_resp.raise_for_status()
+    return items_resp.json()
 
-    for item in items:
-        try:
-            video = VideoData(
-                title=item.get("caption", "")[:80],
-                url=f"https://instagram.com/reel/{item.get('shortcode', '')}/" if item.get('shortcode') else url,
-                likes=int(item.get("likes", 0)),
-                views=int(item.get("views", item.get("likes", 0))),  # fallback
-                caption=item.get("caption", ""),
-                transcript=item.get("transcript", "")[:250],
-                duration_sec=int(item.get("videoDurationSeconds", 0)),
-                post_date=item.get("timestamp", "")[:10],
-                username=username,
-                tipo="Canal",
-                lista="Competidores" if "Competidor" in nombre else "Referentes"
-            )
-            videos.append(video)
-        except Exception as e:
-            print(f"    ⚠️  Error parseando item: {e}")
+def scrapear_canal_instagram(handle: str, reel_count: int = REELS_POR_CANAL) -> list:
+    print(f"    Scrapeando canal @{handle}...")
+    return apify_run_actor(ACTOR_CANAL, {
+        "channelUsername": handle,
+        "reelCount": reel_count
+    })
 
-    print(f"  ✓ {len(videos)} videos extraídos de @{username}")
-    return videos
-
-def process_video(url: str, lista: str) -> List[VideoData]:
-    """Procesa Video (Viral/Explorar) con instagram-scraper"""
-    print(f"  🔍 Procesando video: {url}")
-
-    input_dict = {
-        "directUrls": [url],
+def scrapear_urls_individuales(urls: list[str]) -> list:
+    print(f"    Scrapeando {len(urls)} URLs individuales...")
+    return apify_run_actor(ACTOR_URLS, {
+        "directUrls": urls,
         "resultsType": "posts",
-        "resultsLimit": 10
-    }
+        "resultsLimit": len(urls)
+    })
 
-    dataset_id = call_apify_actor("apify/instagram-scraper", input_dict)
-    if not dataset_id:
-        return []
+# ─── ANÁLISIS ─────────────────────────────────────────────────────────────────
 
-    items = get_apify_dataset(dataset_id)
-    videos = []
-
-    for item in items:
-        try:
-            video = VideoData(
-                title=item.get("caption", "")[:80],
-                url=item.get("url", url),
-                likes=int(item.get("likes", 0)),
-                views=int(item.get("views", item.get("likes", 0))),
-                caption=item.get("caption", ""),
-                transcript="",
-                duration_sec=int(item.get("videoDurationSeconds", 0)),
-                post_date=item.get("timestamp", "")[:10],
-                username=extract_username(item.get("url", "")),
-                tipo="Video",
-                lista=lista
-            )
-            videos.append(video)
-        except Exception as e:
-            print(f"    ⚠️  Error parseando item: {e}")
-
-    print(f"  ✓ {len(videos)} videos extraídos")
-    return videos
-
-def calculate_like_rate(video: VideoData) -> float:
-    """Calcula like rate"""
-    if video.views == 0:
+def calcular_like_rate(video: dict) -> float:
+    likes = video.get("likesCount") or video.get("likes") or 0
+    views = video.get("videoViewCount") or video.get("views") or 0
+    if views == 0:
         return 0.0
-    return (video.likes / video.views) * 100
+    return round((likes / views) * 100, 2)
 
-def filter_outliers(videos: List[VideoData]) -> List[VideoData]:
-    """Filtra outliers: like_rate > max(promedio, 3.0)"""
+def filtrar_outliers(videos: list) -> list:
+    for v in videos:
+        v["like_rate"] = calcular_like_rate(v)
     if not videos:
         return []
-
-    like_rates = [calculate_like_rate(v) for v in videos]
-    promedio = sum(like_rates) / len(like_rates)
-    threshold = max(promedio, 3.0)
-
-    outliers = [v for v in videos if calculate_like_rate(v) > threshold]
-
-    print(f"  📊 Like rate promedio: {promedio:.1f}%")
-    print(f"  🎯 Threshold: {threshold:.1f}%")
-    print(f"  ⭐ {len(outliers)} outliers encontrados")
-
+    promedio = sum(v["like_rate"] for v in videos) / len(videos)
+    umbral   = max(promedio, OUTLIER_UMBRAL)
+    outliers = [v for v in videos if v["like_rate"] > umbral]
+    print(f"    Like rate promedio: {promedio:.1f}% | Umbral: {umbral:.1f}% | Outliers: {len(outliers)}/{len(videos)}")
     return outliers
 
-def classify_patron_gbv(caption: str) -> str:
-    """Clasifica primer patrón GVB según primeras 12 palabras"""
-    words = caption.split()[:12]
-    text = " ".join(words).lower()
+# ─── CLASIFICACIÓN GVB ────────────────────────────────────────────────────────
 
-    # Patrones
-    patterns = {
-        "1 - Negacion Sorpresiva": ["no hagas", "deja de", "no uses", "no debes", "nunca"],
-        "2 - Cifra Concreta": [r"\d+\s*\w+", "3x", "10x", "100%", "aumentó"],
-        "3 - Secreto Revelado": ["lo que nadie", "por esto", "el secreto", "lo que todos"],
-        "4 - Contraste": ["antes", "después", "vs", "versus", "en lugar de"],
-        "5 - Curiosidad Directa": ["¿", "cómo", "qué", "por qué", "sé que"],
-        "6 - Urgencia Novedad": ["acaba de", "esta semana", "ya cambió", "ahora", "recién"],
-    }
+PATRONES_GVB = {
+    1: (r"\b(no|deja de|sin usar|nunca más|para de)\b", "Negación Sorpresiva"),
+    2: (r"\b\d+\b.*(minutos?|horas?|días?|semanas?|segundos?|pasos?|formas?|maneras?)", "Cifra Concreta"),
+    3: (r"\b(nadie te dice|por esto|el secreto|lo que no saben|así es como)\b", "Secreto Revelado"),
+    4: (r"\b(antes|después|de .* a .*|pasé de|cambié|ahora)\b", "Contraste"),
+    5: (r"\?", "Curiosidad Directa"),
+    6: (r"\b(acaba de|esta semana|ya cambió|nuevo|acaban de|lanzaron|actualización)\b", "Urgencia/Novedad"),
+}
 
-    for patron, keywords in patterns.items():
-        for keyword in keywords:
-            if keyword.lower() in text:
-                return patron
+PALABRAS_NEGOCIO = ["clientes", "ventas", "tiempo", "dinero", "ingreso", "crecimiento",
+                    "leads", "facturar", "negocios", "empresa", "cobrar", "monetizar"]
+PALABRAS_TECNICO = ["modelo", "prompt", "parámetro", "token", "api", "llm",
+                    "fine-tuning", "embedding", "vector", "agente técnico"]
 
-    return "4 - Contraste"  # Default
+def clasificar_patron_gvb(texto: str) -> tuple[int, str]:
+    texto_lower = texto.lower()
+    for num, (patron, nombre) in PATRONES_GVB.items():
+        if re.search(patron, texto_lower):
+            return num, nombre
+    return 0, "Sin Patrón"
 
-def classify_tono(caption: str, transcript: str = "") -> str:
-    """Clasifica tono: Operador de Negocio, Tecnico IA, Mixto"""
-    full_text = (caption + " " + transcript).lower()
-
-    negocio_words = ["cliente", "venta", "tiempo", "dinero", "ingresos", "profit", "costo", "roi"]
-    tecnico_words = ["modelo", "prompt", "parámetro", "api", "código", "función", "algoritmo", "red neuronal"]
-
-    negocio_count = sum(1 for w in negocio_words if w in full_text)
-    tecnico_count = sum(1 for w in tecnico_words if w in full_text)
-
-    if negocio_count > tecnico_count:
-        return "Operador de Negocio"
-    elif tecnico_count > negocio_count:
-        return "Tecnico IA"
-    else:
+def detectar_tono(texto: str) -> str:
+    texto_lower = texto.lower()
+    es_negocio = any(p in texto_lower for p in PALABRAS_NEGOCIO)
+    es_tecnico  = any(p in texto_lower for p in PALABRAS_TECNICO)
+    if es_negocio and es_tecnico:
         return "Mixto"
+    if es_negocio:
+        return "Operador de Negocio"
+    if es_tecnico:
+        return "Tecnico IA"
+    return "Operador de Negocio"
 
-def detect_formato(caption: str) -> str:
-    """Detecta formato del contenido"""
-    text = caption.lower()
-
-    if "tier" in text or "ranking" in text:
+def detectar_formato(texto: str) -> str:
+    texto_lower = texto.lower()
+    if any(p in texto_lower for p in ["tier", "ranking", "mejor", "peor", "vs", "comparativa"]):
         return "Tier List"
-    elif "tutorial" in text or "cómo" in text or "paso" in text:
+    if any(p in texto_lower for p in ["cómo", "paso", "tutorial", "aprende", "guía"]):
         return "Tutorial"
-    elif "noticia" in text or "breaking" in text or "nuevo" in text:
+    if any(p in texto_lower for p in ["nuevo", "acaba", "lanzó", "actualización", "cambia"]):
         return "Noticia"
-    elif "antes" in text and "después" in text:
+    if any(p in texto_lower for p in ["antes", "después", "de 0 a", "pasé de"]):
         return "Contraste"
-    elif "caso" in text or "ejemplo" in text:
-        return "Caso de Uso"
-    elif "vs" in text or "versus" in text:
-        return "Comparativa"
+    return "Caso de Uso"
 
-    return "Contraste"  # Default
+def primeras_palabras(texto: str, n: int) -> str:
+    palabras = texto.strip().split()
+    return " ".join(palabras[:n])
 
-def create_hook_page(video: VideoData) -> Optional[str]:
-    """Crea página en Hooks DB. Retorna page ID si éxito"""
-    like_rate = calculate_like_rate(video)
-    patron = classify_patron_gbv(video.caption)
-    tono = classify_tono(video.caption, video.transcript)
-    formato = detect_formato(video.caption)
+# ─── ESCRIBIR EN HOOKS DB ────────────────────────────────────────────────────
 
-    # Primeras 12 palabras del caption
-    hook_texto = " ".join(video.caption.split()[:12])
+def hook_ya_existe(hook_texto: str) -> bool:
+    rows = notion_query(HOOKS_DB, {
+        "property": "Hook Texto",
+        "rich_text": {"equals": hook_texto}
+    })
+    return len(rows) > 0
 
-    # Primeras 15 palabras de transcripción
-    transcript_hook = " ".join(video.transcript.split()[:15]) if video.transcript else ""
+def guardar_hook(outlier: dict, fuente: str, dry_run: bool = False):
+    caption      = outlier.get("caption") or outlier.get("text") or ""
+    transcript   = outlier.get("transcript") or ""
+    hook_texto   = primeras_palabras(caption, 12)
+    trans_hook   = primeras_palabras(transcript, 15) if transcript else ""
+    like_rate    = outlier.get("like_rate", 0.0)
+    views        = outlier.get("videoViewCount") or outlier.get("views") or 0
+    duracion     = outlier.get("videoDuration") or outlier.get("duration") or 0
+    fecha_post   = outlier.get("timestamp") or outlier.get("takenAt") or datetime.now().isoformat()
+    semana       = datetime.now().isocalendar()[1]
 
-    # Semana actual
-    today = date.today()
-    semana = today.isocalendar()[1]
+    if not hook_texto:
+        return
 
-    properties = {
-        "Hook Texto": {
-            "title": [{"text": {"content": hook_texto[:100]}}]
-        },
-        "Transcript Hook": {
-            "rich_text": [{"text": {"content": transcript_hook}}]
-        },
-        "Patron GVB": {
-            "select": {"name": patron}
-        },
-        "Formato": {
-            "select": {"name": formato}
-        },
-        "Like Rate": {
-            "number": round(like_rate, 2)
-        },
-        "Views": {
-            "number": video.views
-        },
-        "Fuente": {
-            "rich_text": [{"text": {"content": f"@{video.username}"}}]
-        },
-        "Duracion seg": {
-            "number": video.duration_sec
-        },
-        "Fecha Post": {
-            "date": {"start": video.post_date} if video.post_date else None
-        },
-        "Semana": {
-            "number": semana
-        },
-        "Tono": {
-            "select": {"name": tono}
-        }
-    }
+    patron_num, _ = clasificar_patron_gvb(caption + " " + transcript)
+    tono          = detectar_tono(caption + " " + transcript)
+    formato       = detectar_formato(caption)
 
-    # Limpiar Nones
-    properties = {k: v for k, v in properties.items() if v.get("date") or k != "Fecha Post"}
+    if dry_run:
+        print(f"    [DRY-RUN] Hook: '{hook_texto}' | {like_rate}% | P{patron_num} | {tono}")
+        return
 
-    url = f"https://api.notion.com/v1/pages"
-    payload = {
-        "parent": {"database_id": HOOKS_DB_DS},
-        "properties": properties
-    }
+    if hook_ya_existe(hook_texto):
+        print(f"    ↩ Duplicado, omitido: '{hook_texto[:40]}...'")
+        return
 
-    try:
-        resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
-        resp.raise_for_status()
-        page_id = resp.json()["id"]
-        return page_id
-    except Exception as e:
-        print(f"    ❌ Error creando page en Hooks DB: {e}")
-        return None
+    notion_create_page(HOOKS_DB, {
+        "Hook Texto":       {"title": [{"text": {"content": hook_texto}}]},
+        "Transcript Hook":  {"rich_text": [{"text": {"content": trans_hook}}]},
+        "Patron GVB":       {"select": {"name": str(patron_num)}},
+        "Formato":          {"select": {"name": formato}},
+        "Like Rate":        {"number": like_rate},
+        "Views":            {"number": views},
+        "Fuente":           {"rich_text": [{"text": {"content": fuente}}]},
+        "Duracion seg":     {"number": duracion},
+        "Fecha Post":       {"date": {"start": fecha_post[:10]}},
+        "Semana":           {"number": semana},
+        "Tono":             {"select": {"name": tono}},
+    })
+    print(f"    ✅ Guardado: '{hook_texto[:50]}' | {like_rate}% | P{patron_num} | {tono}")
 
-def update_urls_monitor_estado(notion_id: str, estado: str, notas: str = "") -> bool:
-    """Actualiza Estado en URLs Monitor"""
-    url = f"https://api.notion.com/v1/pages/{notion_id}"
-
-    properties = {
-        "Estado": {
-            "select": {"name": estado}
-        }
-    }
-
-    if notas:
-        properties["Notas"] = {
-            "rich_text": [{"text": {"content": notas}}]
-        }
-
-    payload = {"properties": properties}
-
-    try:
-        resp = requests.patch(url, headers=NOTION_HEADERS, json=payload)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"    ❌ Error actualizando URLs Monitor: {e}")
-        return False
+# ─── FLUJO PRINCIPAL ──────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", help="Re-procesar todo")
-    parser.add_argument("--source", choices=["competidores", "referentes", "viral"], help="Procesar solo una fuente")
-    parser.add_argument("--limit", type=int, default=10, help="Max videos por categoría")
-    parser.add_argument("--dry-run", action="store_true", help="Mostrar qué haría sin escribir")
+    parser = argparse.ArgumentParser(description="Sabueso — Agente 1 GVB")
+    parser.add_argument("--dry-run",  action="store_true", help="Ver sin escribir en Notion")
+    parser.add_argument("--source",   choices=["competidores", "referentes", "viral"], help="Procesar solo una fuente")
+    parser.add_argument("--limit",    type=int, default=REELS_POR_CANAL, help="Max reels por canal")
     args = parser.parse_args()
 
-    print("\n" + "="*60)
-    print("🐕 EL SABUESO — Iniciando Content Hunt")
-    print("="*60)
+    if not NOTION_API_KEY or not APIFY_API_TOKEN:
+        print("❌ Faltan variables de entorno: NOTION_API_KEY y/o APIFY_API_TOKEN")
+        sys.exit(1)
 
-    # PASO 1: Leer URLs Monitor
-    print("\n📖 PASO 1: Leyendo URLs Monitor...")
-    grouped = get_pending_urls()
+    print("\n🐕 SABUESO — Iniciando\n" + "="*40)
+    total_videos   = 0
+    total_outliers = 0
+    top_hooks      = []
 
-    total_urls = sum(len(v) for v in grouped.values())
-    print(f"  ✓ {total_urls} URLs pendientes encontradas")
-    for lista, urls in grouped.items():
-        if urls:
-            print(f"    • {lista}: {len(urls)} URLs")
+    if not args.source or args.source == "competidores":
+        print("\n📌 Procesando Competidores...")
+        for canal in leer_competidores():
+            videos = scrapear_canal_instagram(canal["handle"], args.limit)
+            total_videos += len(videos)
+            outliers = filtrar_outliers(videos)
+            total_outliers += len(outliers)
+            for o in outliers:
+                guardar_hook(o, f"@{canal['handle']}", dry_run=args.dry_run)
+                caption    = o.get("caption") or ""
+                hook_texto = primeras_palabras(caption, 12)
+                patron_num, _ = clasificar_patron_gvb(caption)
+                top_hooks.append((hook_texto, o["like_rate"], patron_num, canal["handle"]))
 
-    if total_urls == 0:
-        print("\n  ⚠️  Sin URLs pendientes. Ejecuta nuevamente después de agregar.")
-        return
-
-    # PASO 2-3: Scraping + Análisis
-    print("\n🔍 PASO 2-3: Scraping con Apify + Filtrado...")
-    all_videos = []
-    processed_urls = {}
-
-    for lista, urls in grouped.items():
-        if args.source and lista.lower() != args.source:
-            continue
-
-        if not urls:
-            continue
-
-        print(f"\n  📂 {lista}:")
-
-        for idx, url_data in enumerate(urls[:args.limit], 1):
-            print(f"\n  [{idx}/{len(urls)}] {url_data['nombre']}")
-
-            if url_data["tipo"] == "Canal":
-                videos = process_canal(url_data["nombre"], url_data["url"])
+    if not args.source or args.source == "referentes":
+        print("\n📚 Procesando Referentes...")
+        for ref in leer_referentes():
+            plataforma = ref.get("plataforma", "Instagram")
+            if "instagram" in plataforma.lower():
+                handle = ref["url"].rstrip("/").split("/")[-1].lstrip("@")
+                videos = scrapear_canal_instagram(handle, args.limit)
             else:
-                videos = process_video(url_data["url"], lista)
+                print(f"  ⚠️  {ref['nombre']} es YouTube — actor pendiente de configurar")
+                continue
+            total_videos += len(videos)
+            outliers = filtrar_outliers(videos)
+            total_outliers += len(outliers)
+            for o in outliers:
+                guardar_hook(o, f"@{ref['nombre']}", dry_run=args.dry_run)
+                caption    = o.get("caption") or ""
+                hook_texto = primeras_palabras(caption, 12)
+                patron_num, _ = clasificar_patron_gvb(caption)
+                top_hooks.append((hook_texto, o["like_rate"], patron_num, ref["nombre"]))
 
-            # Filtrar outliers
-            outliers = filter_outliers(videos)
+    if not args.source or args.source == "viral":
+        print("\n🔍 Procesando Viral/Explorar desde Mis Ideas...")
+        items = leer_viral_explorar()
+        if items:
+            urls     = [i["url"] for i in items]
+            page_ids = [i["page_id"] for i in items]
+            videos   = scrapear_urls_individuales(urls)
+            total_videos += len(videos)
+            outliers = filtrar_outliers(videos)
+            total_outliers += len(outliers)
+            for o in outliers:
+                fuente = o.get("ownerUsername") or "viral/explorar"
+                guardar_hook(o, f"@{fuente}", dry_run=args.dry_run)
+                caption    = o.get("caption") or ""
+                hook_texto = primeras_palabras(caption, 12)
+                patron_num, _ = clasificar_patron_gvb(caption)
+                top_hooks.append((hook_texto, o["like_rate"], patron_num, fuente))
+            if not args.dry_run:
+                for pid in page_ids:
+                    marcar_viral_procesado(pid)
+                    print(f"  ✅ Marcado como Procesado: {pid}")
 
-            all_videos.extend(outliers)
-            processed_urls[url_data["id"]] = {
-                "total": len(videos),
-                "outliers": len(outliers),
-                "error": False
-            }
+    top_hooks.sort(key=lambda x: x[1], reverse=True)
 
-            time.sleep(2)  # Rate limiting
+    patrones = [h[2] for h in top_hooks if h[2] > 0]
+    patron_frecuente = max(set(patrones), key=patrones.count) if patrones else "—"
+    _, patron_nombre = PATRONES_GVB.get(patron_frecuente, (None, "Sin datos"))
 
-    if not all_videos:
-        print("\n  ⚠️  Sin videos/outliers encontrados.")
-        return
+    print(f"""
+SABUESO COMPLETADO
+==================
+Videos analizados:  {total_videos}
+Outliers guardados: {total_outliers}
 
-    print(f"\n\n✨ PASO 4-5: Clasificación GVB + Escritura en Hooks DB...")
-    print(f"  📊 {len(all_videos)} outliers para procesar")
+Top 3 hooks esta semana:""")
 
-    hooks_created = 0
-    patron_counts = {}
-    like_rates = []
+    for i, (hook, lr, pnum, fuente) in enumerate(top_hooks[:3], 1):
+        _, pnombre = PATRONES_GVB.get(pnum, (None, "?"))
+        print(f"  {i}. \"{hook}\" — {lr}% — P{pnum} {pnombre} — @{fuente}")
 
-    for idx, video in enumerate(all_videos, 1):
-        like_rate = calculate_like_rate(video)
-        like_rates.append(like_rate)
-        patron = classify_patron_gbv(video.caption)
-
-        patron_counts[patron] = patron_counts.get(patron, 0) + 1
-
-        print(f"\n  [{idx}/{len(all_videos)}] {video.title[:40]}...")
-        print(f"     Like rate: {like_rate:.1f}% | Patrón: {patron}")
-
-        if not args.dry_run:
-            page_id = create_hook_page(video)
-            if page_id:
-                print(f"     ✓ Guardado en Hooks DB")
-                hooks_created += 1
-
-    # PASO 6: Actualizar URLs Monitor
-    print(f"\n\n📝 PASO 6: Actualizando URLs Monitor...")
-    for notion_id, result in processed_urls.items():
-        if not args.dry_run:
-            update_urls_monitor_estado(notion_id, "Procesado")
-            print(f"  ✓ {notion_id}: Estado → Procesado")
-
-    # PASO 7: Output
-    print("\n\n" + "="*60)
-    print("✅ SABUESO COMPLETADO")
-    print("="*60)
-
-    avg_like_rate = sum(like_rates) / len(like_rates) if like_rates else 0
-    print(f"\n📊 ESTADÍSTICAS:")
-    print(f"  • Canales procesados: {sum(1 for k, v in processed_urls.items())}")
-    print(f"  • Videos analizados: {sum(r['total'] for r in processed_urls.values())}")
-    print(f"  • Outliers guardados: {hooks_created}")
-    print(f"  • Promedio like rate: {avg_like_rate:.1f}%")
-
-    if all_videos:
-        top_3 = sorted(all_videos, key=lambda v: calculate_like_rate(v), reverse=True)[:3]
-        print(f"\n⭐ TOP 3 HOOKS ESTA SEMANA:")
-        for idx, video in enumerate(top_3, 1):
-            print(f"  {idx}. \"{video.title[:50]}\" — {calculate_like_rate(video):.1f}% — {classify_patron_gbv(video.caption)} — @{video.username}")
-
-    if patron_counts:
-        most_common = max(patron_counts.items(), key=lambda x: x[1])
-        print(f"\n🎯 Patrón GVB más frecuente: {most_common[0]} ({most_common[1]} hooks)")
-
-    print(f"\n→ Listo para /viral:destrip (próximo agente)\n")
+    print(f"""
+Patrón GVB más frecuente: P{patron_frecuente} — {patron_nombre}
+{"[DRY-RUN — nada fue guardado en Notion]" if args.dry_run else ""}
+→ Listo para /viral:destrip
+""")
 
 if __name__ == "__main__":
     main()
