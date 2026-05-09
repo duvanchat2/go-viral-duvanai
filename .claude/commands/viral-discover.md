@@ -2,7 +2,7 @@
 
 Agente 1 del sistema go-viral: Descubre hooks virales en competidores, referentes y tendencias, clasifica por patrón GVB y almacena en Hooks DB.
 
-**Flow:** Lee URLs Monitor (Notion) → Scraping con Apify → Análisis de like rate → Clasificación GVB → Escribe Hooks DB → Actualiza URLs Monitor
+**Flow:** Lee 3 colecciones Notion (Competidores, Referentes, Mis Ideas) → Scraping con Apify → Análisis de like rate → Clasificación GVB → Escribe Hooks DB → Marca URLs procesadas
 
 ---
 
@@ -26,31 +26,58 @@ Este comando ejecuta automáticamente el flujo completo. Usa las credenciales en
 
 ## REQUISITOS PREVIOS
 
-✅ **Notion:** 4 bases de datos ya creadas (IDs en código)
+✅ **Notion:** 3 colecciones separadas (Competidores, Referentes, Mis Ideas)
 ✅ **Apify:** Token en `.env` con créditos disponibles
-✅ **URLs Monitor:** al menos 1 URL con Estado = "Pendiente"
+✅ **Competidores:** al menos 1 entrada con Activo = true
+✅ **Mis Ideas:** al menos 1 URL con Origen = "Viral/Explorar" y Estado = "Idea cruda"
 ✅ **Python:** 3.8+ con `requests` y `python-dotenv`
 
 ---
 
 ## PASOS DEL FLUJO
 
-### PASO 1: Leer URLs Monitor
-- Conectar a Notion `collection://01901dbf-447d-4425-a06d-a042ec223e7c`
-- Extraer filas donde `Estado = "Pendiente"`
-- Agrupar por `Lista`: Competidores | Referentes | Viral/Explorar
+### PASO 1: Leer las 3 colecciones Notion
+
+**📌 Competidores** — `collection://6d44cbde-c6cb-470a-9bd4-c2100562de56`
+- Filtro: `Activo = true`
+- Extraer: Handle, URL Instagram
+- Actor: `sian.agency/instagram-ai-transcript-extractor`
+
+**📚 Referentes** — `collection://c08bdc84-071a-4032-83a0-860b0e36f118`
+- Filtro: `Activo = true`
+- Extraer: Nombre, URL Canal, Plataforma
+- Si `Plataforma = Instagram` → actor de canales: `sian.agency/instagram-ai-transcript-extractor`
+- Si `Plataforma = YouTube` → `apify/youtube-scraper`
+
+**💡 Mis Ideas** — `collection://9ed953db-9a49-4d3c-b786-6dec10264490`
+- Filtro: `Origen = "Viral/Explorar" AND Estado = "Idea cruda"`
+- Extraer: campo "De que va" (URL directa)
+- Actor: `apify/instagram-scraper` (URLs individuales)
+- **Al terminar:** actualizar `Estado = "Procesado"` en cada página
 
 ### PASO 2: Scraping con Apify
-**Para Canal (Competidores + Referentes):**
+
+**Para Competidores (canales Instagram):**
 ```json
 Actor: sian.agency/instagram-ai-transcript-extractor
-Input: { "channelUsername": "byduvan_ai", "reelCount": 10 }
+Input: { "channelUsername": "handle", "reelCount": 10 }
 ```
 
-**Para Video (Viral/Explorar):**
+**Para Referentes (canales por plataforma):**
+```json
+Si Instagram:
+  Actor: sian.agency/instagram-ai-transcript-extractor
+  Input: { "channelUsername": "handle", "reelCount": 10 }
+
+Si YouTube:
+  Actor: apify/youtube-scraper
+  Input: { "channelUrl": "url", "resultsLimit": 10 }
+```
+
+**Para Mis Ideas (URLs directas de posts):**
 ```json
 Actor: apify/instagram-scraper
-Input: { "directUrls": ["url1"], "resultsType": "posts", "resultsLimit": 10 }
+Input: { "directUrls": ["url"], "resultsType": "posts", "resultsLimit": 1 }
 ```
 
 Polling hasta status `SUCCEEDED`, leer dataset output.
@@ -94,16 +121,18 @@ Semana ← week number
 Tono ← Operador de Negocio|Tecnico IA|Mixto
 ```
 
-### PASO 6: Actualizar Estado en URLs Monitor
-Para cada fila procesada:
+### PASO 6: Actualizar Estados en Mis Ideas
+Para cada URL de Viral/Explorar procesada:
 - Sin error → `Estado = "Procesado"`
-- Con error Apify → `Estado = "Error"`, agregar nota
+- Con error Apify → `Estado = "Error"`, agregar nota en página
 
 ### PASO 7: Output Terminal
 ```
 SABUESO COMPLETADO
 ==================
-Canales procesados: N
+Competidores procesados: N
+Referentes procesados: N
+URLs Viral/Explorar procesadas: N
 Videos analizados: N
 Outliers guardados: N
 Promedio like rate: X%
@@ -127,9 +156,10 @@ NOTION_API_KEY=ntn_...
 APIFY_API_TOKEN=apify_...
 ```
 
-Datos iniciales en URLs Monitor:
-- soyenriquerocha (Lista: Competidores, Estado: Pendiente)
-- byduvan_ai (Lista: Referentes, Estado: Pendiente)
+Datos iniciales:
+- Competidores: al menos 1 entrada con Activo = true
+- Referentes: al menos 1 entrada con Activo = true
+- Mis Ideas: al menos 1 URL con Origen = "Viral/Explorar" y Estado = "Idea cruda"
 
 ---
 
