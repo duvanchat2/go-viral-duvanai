@@ -134,18 +134,29 @@ def leer_referentes() -> list[dict]:
         "checkbox": {"equals": True}
     })
     resultado = []
+    omitidos = 0
     for row in rows:
-        nombre    = get_prop(row, "Nombre")
-        url_canal = get_prop(row, "URL Canal")
+        nombre     = get_prop(row, "Nombre")
+        url_canal  = get_prop(row, "URL Canal")
         plataforma = get_prop(row, "Plataforma")
+        select     = get_prop(row, "Select")
+        seguidores = get_prop(row, "seguidores")
+
+        if select == "Herramienta IA":
+            omitidos += 1
+            continue
+
         if url_canal:
             resultado.append({
                 "nombre": nombre,
                 "url": url_canal,
                 "plataforma": plataforma or "Instagram",
+                "seguidores": seguidores,
                 "tipo": "referente"
             })
     print(f"  → {len(resultado)} referentes activos")
+    if omitidos > 0:
+        print(f"  → [{omitidos}] referentes omitidos (Herramienta IA — monitorear via X)")
     return resultado
 
 def leer_viral_explorar() -> list[dict]:
